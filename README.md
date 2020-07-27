@@ -1,2 +1,2 @@
-# SMT-solver
-DPLL-based SMT-solver
+# SAT-solver
+DPLL-based SAT-solver
