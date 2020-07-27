@@ -1,122 +1,91 @@
-import cats.effect.IO
+import cats.effect.{IO, Resource}
 
-sealed trait ClauseStatus
-final case class Updated(add: Literal[Theory], w: Watcher) extends ClauseStatus
-final case class UnitClause(lit: Literal[Theory])          extends ClauseStatus
-case object TrueClause                                     extends ClauseStatus
-
-case object Backtrackx
-
-final case class Trace(M: Vector[Literal[Theory]] = Vector.empty, lastDecide: List[Int] = Nil) {
-  def addDecide(atom: Literal[Theory]): Trace =
-    Trace(M :+ atom, M.length :: lastDecide)
-  def addUnitProp(atom: Literal[Theory]): Trace = Trace(M :+ atom, lastDecide)
-
-  def lastOption = M.lastOption
-
-  def last = M.last
-
-  def backtrack(activeRing: ActiveRing): Either[Fail.type, (Trace, ActiveRing)] =
-    if (lastDecide.nonEmpty) {
-      val prefix = M.slice(0, lastDecide.head) :+ !M(lastDecide.head)
-      val suffix = M.slice(lastDecide.head + 1, M.length)
-      Right(
-        Trace(
-          prefix,
-          lastDecide.tail
-        ),
-        ActiveRing(activeRing.ring ++ suffix.map(_.makeAtom))
-      )
-    } else Left(Fail)
-}
-
-final case class ActiveRing(ring: Vector[Atom[Theory]]) extends AnyVal {
-  def nextEither(trace: Trace): Either[String, Atom[Theory]] = {
-    if (ring.isEmpty) Left("ActiveRing nextEither isEmpty")
-    else
-      Right(ring.head)
-  }
-}
-
-/**
-  * @param disjId
-  * @param litPos is 0 or 1
-  */
-final case class Watcher(disjId: Int, litPos: Int) {
-  def moveWatcher(conj: CNForm, trace: Trace): (CNForm, ClauseStatus) = {
-    val disj: Disjunct[Literal[Theory]] = conj.cnf.conj(disjId)
-    val traceSet                        = trace.M.toSet
-
-    val isTrueClause = disj.disj.exists(l => traceSet(!l))
-
-    if (isTrueClause) {
-      (conj, TrueClause)
-    } else {
-      val unassignedLit =
-        disj.disj.zipWithIndex
-          .drop(2)
-          .filterNot(l => traceSet(l._1))
-      if (unassignedLit.isEmpty) {
-        (conj, UnitClause(disj.disj(neighbourId)))
-      } else {
-        val next = unassignedLit.head
-        val newDisj =
-          disj.disj.updated(litPos, next._1).updated(disj.disj.indexOf(next._1), disj.disj(litPos))
-        (
-          CNForm(Conjunct(conj.cnf.conj.updated(disjId, Disjunct(newDisj)))),
-          Updated(next._1, this)
-        )
-
-      }
-    }
-  }
-
-  def neighbourId: Int = Math.abs(litPos - 1)
-}
-
-final case class Watchers(watchersMap: Map[Literal[Theory], Set[Watcher]]) extends AnyVal {
-  def updateWatch(
-      conj: CNForm,
-      v: Literal[Theory],
-      trace: Trace
-  ): (CNForm, Trace, Watchers, Vector[UnitClause]) = {
-    watchersMap.get(v) match {
-      case Some(value) =>
-        val (cnfff, wm, clsList) = value
-          .foldLeft[
-            (CNForm, Map[Literal[Theory], Set[Watcher]], Vector[UnitClause])
-          ]((conj, watchersMap, Vector.empty))((acc, wz) => {
-            val (nextCNF, status) = wz.moveWatcher(acc._1, trace)
-            status match {
-              case Updated(add, ww) => {
-                val deletedList = acc._2(v) - ww
-                val updatedMap = acc._2
-                  .updated(v, deletedList)
-                  .updated(add, acc._2.getOrElse(add, Set.empty) + ww)
-                (nextCNF, updatedMap, acc._3)
-              }
-              case s @ UnitClause(lit) =>
-                (nextCNF, acc._2, acc._3 :+ s)
-              case TrueClause => (acc._1, acc._2, acc._3)
-            }
-
-          })
-        (cnfff, trace, Watchers(wm), clsList)
-      case None => {
-        (conj, trace, this, Vector.empty)
-      }
-    }
-  }
-}
-
+import scala.io.BufferedSource
 final case class DPLL(cnf: CNForm, trace: Trace, watchers: Watchers, ring: ActiveRing)
-
-trait DPLLStatus
-case object Fail                 extends DPLLStatus
-case object Conflict             extends DPLLStatus
-final case class SAT(dpll: DPLL) extends DPLLStatus
-
 object DPLL {
+
+  def fromDimacs(filename: String): IO[Vector[Map[String, Boolean]]] = {
+    val file = IO(scala.io.Source.fromFile(filename))
+
+    for {
+      (cnfForm, ring) <- parseDimacs(file)
+      watchers        <- createWatchers(cnfForm)
+      dpll            <- createDPLL(cnfForm, Trace(), watchers, ring)
+      satRes          <- DPLL.solve(dpll, Vector.empty, 0, Vector.empty, isStart = true)
+      res             <- makeHumanReadeable(satRes)
+    } yield res
+  }
+
+  private def makeHumanReadeable(vt: Vector[Trace]): IO[Vector[Map[String, Boolean]]] = IO {
+    vt.foldLeft(Vector.empty[Map[String, Boolean]]) { (acc, t) => acc :+ traceToMap(t) }
+  }
+
+  private def traceToMap(t: Trace): Map[String, Boolean] = t.M.foldLeft(Map.empty[String, Boolean]) { (acc, lit) =>
+    lit match {
+      case Atom(a) =>
+        acc + {
+          a match {
+            case Rvar(id)  => (id.toString, false)
+            case Var(name) => (name, false)
+          }
+        }
+      case NotAtom(a) =>
+        acc + {
+          a match {
+            case Rvar(id)  => (id.toString, true)
+            case Var(name) => (name, true)
+          }
+        }
+    }
+  }
+
+  private def createDPLL(cnf: CNForm, trace: Trace, watchers: Watchers, ring: ActiveRing): IO[DPLL] = IO {
+    DPLL(cnf, trace, watchers, ring)
+  }
+
+  private def createWatchers(CNForm: CNForm): IO[Watchers] = IO {
+    Watchers(initWatchers(CNForm.cnf))
+  }
+
+  private def parseDimacs(fileBuf: IO[BufferedSource]): IO[(CNForm, ActiveRing)] = {
+    Resource.fromAutoCloseable(fileBuf).use { buf: BufferedSource =>
+      IO {
+        val disjSetPair = for {
+          line <- buf.getLines
+          if !line.startsWith("c") && !line.startsWith("p")
+        } yield {
+          parseLine(line)
+        }
+
+        val (disjs, atoms) = disjSetPair.foldLeft((List.empty[Disjunct[Literal[Theory]]], Set.empty[Atom[Theory]])) {
+          (acc, p) => (p._1 :: acc._1, acc._2 ++ p._2)
+        }
+
+        (CNForm(Conjunct(disjs)), ActiveRing(atoms.toVector))
+      }
+    }
+  }
+
+  private def parseLine(line: String): (Disjunct[Literal[Theory]], Set[Atom[Theory]]) = {
+    val (literals, atoms) = line
+      .split(" ")
+      .dropRight(1)
+      .map(_.toInt)
+      .map { x =>
+        if (x > 0) {
+          val lit  = Theory.atom(s"$x")
+          val atom = Atom(Var(s"$x"))
+          (lit, atom)
+        } else {
+          val lit  = Theory.notAtom(s"${-x}")
+          val atom = Atom(Var(s"${-x}"))
+          (lit, atom)
+        }
+      }
+      .unzip
+
+    Disjunct(literals) -> Set.from(atoms)
+  }
 
   def solve(
       dpll: DPLL,
@@ -133,7 +102,7 @@ object DPLL {
     } yield res
   }
 
-  def unitOrDecide(
+  private def unitOrDecide(
       updateWatchDpll: DPLL,
       nextUnitClausesList: Vector[UnitClause],
       agg: Vector[Trace],
@@ -164,23 +133,18 @@ object DPLL {
       }
   }
 
-  def update(dpll: DPLL, isStart: Boolean): IO[(DPLL, Vector[UnitClause])] = {
+  private def update(dpll: DPLL, isStart: Boolean): IO[(DPLL, Vector[UnitClause])] = {
     if (!isStart) updateWatchersByLastLit(dpll)
     else IO(dpll, Vector.empty)
   }
 
-  def updateWatchersByLastLit(
-      dpll: DPLL,
-  ): IO[(DPLL, Vector[UnitClause])] = IO {
+  private def updateWatchersByLastLit(dpll: DPLL): IO[(DPLL, Vector[UnitClause])] = IO {
     val lit = dpll.trace.last
     val res = dpll.watchers.updateWatch(dpll.cnf, lit, dpll.trace)
     (dpll.copy(cnf = res._1, watchers = res._3), res._4)
   }
 
-  def unitPropagate(
-      dpll: DPLL,
-      unitClause: UnitClause
-  ): IO[Either[Backtrack.type, DPLL]] = IO {
+  private def unitPropagate(dpll: DPLL, unitClause: UnitClause): IO[Either[Backtrack.type, DPLL]] = IO {
     val lit: Literal[Theory] = !unitClause.lit
     if (dpll.trace.M.contains(unitClause.lit)) Left(Backtrack)
     else
@@ -190,7 +154,7 @@ object DPLL {
       )
   }
 
-  def backtrack(dpll: DPLL): IO[Either[Fail.type, DPLL]] = IO {
+  private def backtrack(dpll: DPLL): IO[Either[Fail.type, DPLL]] = IO {
     dpll.trace.backtrack(dpll.ring) match {
       case Left(value) =>
         Left(Fail)
@@ -199,7 +163,7 @@ object DPLL {
     }
   }
 
-  def decide(dpll: DPLL): IO[Either[DPLL, SAT]] = IO {
+  private def decide(dpll: DPLL): IO[Either[DPLL, SAT]] = IO {
     dpll.ring.nextEither(trace = dpll.trace) match {
       case Left(value) =>
         Right(SAT(dpll))
@@ -208,7 +172,7 @@ object DPLL {
     }
   }
 
-  def initWatchers(conjunct: Conjunct[Disjunct[Literal[Theory]]]) =
+  def initWatchers(conjunct: Conjunct[Disjunct[Literal[Theory]]]): Map[Literal[Theory], Set[Watcher]] =
     conjunct.conj.zipWithIndex.foldLeft(Map[Literal[Theory], Set[Watcher]]()) {
       case (acc, (disj, i)) => {
         val litToWatcher = disj.disj.take(2).zipWithIndex.map(t => (t._1, Watcher(i, t._2)))

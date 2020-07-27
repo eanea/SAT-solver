@@ -4,6 +4,10 @@ object CNF {
     def cnf(f: A): (CNForm, Literal[Theory])
   }
 
+  /**
+   * Tseytin transformation
+   * @return
+   */
   implicit def NNFtoCNF: CNF[NNForm] = (f: NNForm) => {
     def go(formula: NNForm): (Seq[Conjunct[Disjunct[Literal[Theory]]]], Literal[Theory]) = {
       formula match {
